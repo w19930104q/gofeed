@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -58,9 +59,29 @@ type Parser struct {
 	// accessible via Feed.OriginalFeed(). Off by default: keeping it holds a
 	// second copy of the feed in memory for the lifetime of the result.
 	KeepOriginalFeed bool
-	rp               *rss.Parser
-	ap               *atom.Parser
-	jp               *json.Parser
+	// ResolveRelativeURLs makes relative link and enclosure references in
+	// RSS and Atom feeds resolvable for later crawling. It is off by default,
+	// so feeds keep their URLs exactly as written unless this is set.
+	//
+	// When enabled:
+	//   - ParseURL/ParseURLWithContext use the final URL after HTTP redirects
+	//     as the document-level base; ParseWithBase/ParseStringWithBase use an
+	//     explicitly supplied source URL.
+	//   - In-document xml:base values still apply and are combined with the
+	//     source URL, scoped to their element, so siblings never share or leak
+	//     a base.
+	//   - Links, enclosure/attachment URLs and href/src in Atom HTML content
+	//     are resolved; the universal Feed, the OriginalFeed and any custom
+	//     Translator all observe the same resolved values.
+	//   - GUIDs and Atom ids are identifiers and are never rewritten.
+	//
+	// The base for a parse is passed as an argument rather than stored on the
+	// Parser, so one Parser can crawl different sources concurrently with no
+	// shared mutable state.
+	ResolveRelativeURLs bool
+	rp                  *rss.Parser
+	ap                  *atom.Parser
+	jp                  *json.Parser
 }
 
 // Auth is a structure allowing to
@@ -106,7 +127,32 @@ const detectionPeekSize = 4096
 // Only the first few KB are buffered to detect the feed type; RSS and Atom
 // content is then parsed incrementally from the reader. JSON feeds are read
 // fully into memory, as JSON decoding needs the complete document.
+//
+// Even when ResolveRelativeURLs is enabled, Parse has no source URL to use as
+// a base: use ParseWithBase (or ParseURL, which derives the base from the
+// final response URL) to resolve relative references.
 func (f *Parser) Parse(feed io.Reader) (*Feed, error) {
+	return f.ParseWithBase(feed, "")
+}
+
+// ParseWithBase works like Parse but supplies sourceURL as the document-level
+// base for relative reference resolution. Relative URLs are resolved only when
+// ResolveRelativeURLs is enabled; otherwise sourceURL is ignored and the call
+// behaves exactly like Parse. In-document xml:base values are combined with
+// sourceURL, scoped to the element that declares them.
+//
+// A non-empty sourceURL that fails to parse as a URL returns the parse error.
+// sourceURL is held for this parse only; it is never stored on the Parser, so
+// concurrent parses with different sources cannot observe each other's base.
+func (f *Parser) ParseWithBase(feed io.Reader, sourceURL string) (*Feed, error) {
+	var base *url.URL
+	if f.ResolveRelativeURLs && sourceURL != "" {
+		var err error
+		if base, err = url.Parse(sourceURL); err != nil {
+			return nil, err
+		}
+	}
+
 	// Peek at the start of the stream to detect the feed type, without
 	// consuming it: the format parser below reads from the beginning. A
 	// reader error here surfaces as itself rather than as a failed type
@@ -119,10 +165,11 @@ func (f *Parser) Parse(feed io.Reader) (*Feed, error) {
 
 	switch DetectFeedType(bytes.NewReader(prefix)) {
 	case FeedTypeAtom:
-		return f.parseAtomFeed(br)
+		return f.parseAtomFeed(br, base)
 	case FeedTypeRSS:
-		return f.parseRSSFeed(br)
+		return f.parseRSSFeed(br, base)
 	case FeedTypeJSON:
+		// JSON feeds do not carry xml:base; their URLs are left as written.
 		return f.parseJSONFeed(br)
 	}
 
@@ -178,11 +225,18 @@ func (f *Parser) ParseURLWithContext(feedURL string, ctx context.Context) (feed 
 		}
 	}
 
+	// resp.Request.URL is the final request URL after every redirect, which
+	// is the correct base for relative references in the response body.
+	var baseURL string
+	if f.ResolveRelativeURLs && resp.Request != nil && resp.Request.URL != nil {
+		baseURL = resp.Request.URL.String()
+	}
+
 	if f.MaxByteSize <= 0 {
-		return f.Parse(resp.Body)
+		return f.ParseWithBase(resp.Body, baseURL)
 	}
 	body := &limitedReader{r: resp.Body, left: f.MaxByteSize}
-	feed, err = f.Parse(body)
+	feed, err = f.ParseWithBase(body, baseURL)
 	if body.err == ErrResponseTooLarge {
 		return nil, ErrResponseTooLarge
 	}
@@ -235,8 +289,16 @@ func (f *Parser) ParseString(feed string) (*Feed, error) {
 	return f.Parse(strings.NewReader(feed))
 }
 
-func (f *Parser) parseAtomFeed(feed io.Reader) (*Feed, error) {
-	af, err := f.ap.Parse(feed)
+// ParseStringWithBase works like ParseString but supplies sourceURL as the
+// document-level base for relative reference resolution when
+// ResolveRelativeURLs is enabled; otherwise it behaves exactly like
+// ParseString.
+func (f *Parser) ParseStringWithBase(feed, sourceURL string) (*Feed, error) {
+	return f.ParseWithBase(strings.NewReader(feed), sourceURL)
+}
+
+func (f *Parser) parseAtomFeed(feed io.Reader, base *url.URL) (*Feed, error) {
+	af, err := f.ap.ParseWithBase(feed, base)
 	if err != nil {
 		return nil, err
 	}
@@ -245,8 +307,8 @@ func (f *Parser) parseAtomFeed(feed io.Reader) (*Feed, error) {
 	return result, err
 }
 
-func (f *Parser) parseRSSFeed(feed io.Reader) (*Feed, error) {
-	rf, err := f.rp.Parse(feed)
+func (f *Parser) parseRSSFeed(feed io.Reader, base *url.URL) (*Feed, error) {
+	rf, err := f.rp.ParseWithBase(feed, base)
 	if err != nil {
 		return nil, err
 	}

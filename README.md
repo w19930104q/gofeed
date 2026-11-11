@@ -221,6 +221,47 @@ feed, _ := fp.ParseString(feedData)
 fmt.Println(feed.Author) // Valentine Wiggin
 ```
 
+#### Resolving Relative URLs Against a Source URL
+
+Feeds commonly publish relative links and enclosure URLs. By default gofeed
+keeps every URL exactly as written, so nothing is rewritten unless you opt in.
+Setting `ResolveRelativeURLs` makes those references absolute and ready for
+later crawling.
+
+When the option is enabled:
+
+- `ParseURL` and `ParseURLWithContext` resolve relative references against the
+  final URL returned after HTTP redirects.
+- For string and `io.Reader` input, supply the source explicitly with
+  `ParseStringWithBase` and `ParseWithBase`.
+- In-document `xml:base` values still apply, are combined with the source URL,
+  and stay scoped to the element that declares them, so sibling elements never
+  share or leak a base.
+- Links, enclosure/attachment URLs and the `href`/`src` attributes in Atom HTML
+  content are resolved.
+- GUIDs and Atom `id` values are identifiers and are never rewritten.
+- The universal `Feed`, the feed returned by `OriginalFeed()` and any custom
+  translator all observe the same resolved values.
+
+The source URL is passed per parse rather than stored on the parser, so a
+single `Parser` can crawl different sources concurrently without state leaking
+between parses. JSON feeds carry no `xml:base` and are left unchanged.
+
+```go
+fp := gofeed.NewParser()
+fp.ResolveRelativeURLs = true
+
+// The base is the final URL after any redirects.
+feed, err := fp.ParseURL("https://example.com/feed.xml")
+
+// String and reader entry points take an explicit source URL.
+feed, err = fp.ParseStringWithBase(feedData, "https://example.com/feed/index.xml")
+feed, err = fp.ParseWithBase(reader, "https://example.com/feed/index.xml")
+```
+
+The format-specific `rss.Parser` and `atom.Parser` expose the same capability
+through `ParseWithBase(reader, *url.URL)`.
+
 ## Dependencies
 
 * [goxpp](https://github.com/mmcdole/goxpp) - XML pull parser

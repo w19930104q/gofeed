@@ -52,6 +52,14 @@ const xmlWhitespace = " \t\r\n"
 // if the next immediate token isnt a Start/EndTag.  Instead, it will continue
 // to consume tokens until it hits a Start/EndTag or EndDocument.
 func NextTag(p *xpp.Parser) (event xpp.EventType, err error) {
+	return NextTagWithBase(p, nil)
+}
+
+// NextTagWithBase is NextTag with a document-level base URL supplied by the
+// caller (the feed's source URL). URI attributes resolve against
+// EffectiveBase(docBase, xml:base in scope). Passing a nil docBase reproduces
+// NextTag's historical behavior exactly.
+func NextTagWithBase(p *xpp.Parser, docBase *url.URL) (event xpp.EventType, err error) {
 	for {
 		event, err = p.Next()
 		if err != nil {
@@ -63,11 +71,7 @@ func NextTag(p *xpp.Parser) (event xpp.EventType, err error) {
 		}
 
 		if event == xpp.StartTag {
-			if err != nil {
-				return
-			}
-
-			err = resolveAttrs(p)
+			err = resolveAttrs(p, docBase)
 			if err != nil {
 				return
 			}
@@ -83,11 +87,33 @@ func NextTag(p *xpp.Parser) (event xpp.EventType, err error) {
 	return
 }
 
-// resolveAttrs trims surrounding XML whitespace from URI attributes and, when
-// an xml:base is in scope, resolves them against it. Without a base the
-// trimmed value is kept as written, never normalized by url.Parse.
-func resolveAttrs(p *xpp.Parser) error {
-	base := p.BaseURL()
+// EffectiveBase combines the feed's document-level source URL with the
+// xml:base currently in scope. In-document xml:base values normally resolve
+// against their parent inside the XML parser, but a base declared with a
+// relative reference at (or near) the root has no absolute parent until the
+// source URL is supplied here: any still-relative in-scope base is resolved
+// against docBase.
+//
+// EffectiveBase is a pure function: neither argument is mutated, so the same
+// docBase can safely back sibling elements and concurrent parses. A nil
+// docBase returns the in-scope base unchanged, keeping the no-source parse
+// path identical to the historical behavior.
+func EffectiveBase(docBase, inScope *url.URL) *url.URL {
+	if inScope == nil {
+		return docBase
+	}
+	if docBase != nil && !inScope.IsAbs() {
+		return docBase.ResolveReference(inScope)
+	}
+	return inScope
+}
+
+// resolveAttrs trims surrounding XML whitespace from URI attributes and
+// resolves them against the effective base (document source URL combined with
+// the xml:base in scope). Without any base the trimmed value is kept as
+// written, never normalized by url.Parse.
+func resolveAttrs(p *xpp.Parser, docBase *url.URL) error {
+	base := EffectiveBase(docBase, p.BaseURL())
 	attrs := p.Attrs()
 	for i, attr := range attrs {
 		if !uriAttrs[strings.ToLower(attr.Name.Local)] {
@@ -120,13 +146,12 @@ func XmlBaseResolveUrl(b *url.URL, u string) (*url.URL, error) {
 	return b.ResolveReference(relURL), nil
 }
 
-// ResolveURLIfBase resolves s against base when an xml:base is in scope,
-// returning s unchanged when base is nil or resolution fails. Element-content
-// URLs (e.g. an RSS <link>) don't pass through resolveAttrs, so this lets them
-// be resolved the same way attribute URLs already are. Resolving only when a
-// base is present means URLs in feeds without xml:base are never round-tripped
-// through url.Parse and so are never normalized.
-func ResolveURLIfBase(base *url.URL, s string) string {
+// ResolveURL resolves s against base, returning s unchanged when base is nil
+// or resolution fails. Element-content URLs (e.g. an RSS <link>) don't pass
+// through the attribute resolver, so this lets them be resolved the same way
+// attribute URLs are. A nil base returns s untouched, so feeds parsed without
+// a source URL keep their values exactly as written.
+func ResolveURL(base *url.URL, s string) string {
 	if base == nil || s == "" {
 		return s
 	}

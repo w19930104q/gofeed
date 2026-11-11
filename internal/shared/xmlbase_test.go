@@ -126,3 +126,93 @@ func TestResolveHTMLPlainTextRoundTrip(t *testing.T) {
 		t.Errorf("resolved = %q, want %q", got, "hello world")
 	}
 }
+
+// EffectiveBase combines a document-level source URL with the xml:base in
+// scope. The in-document base wins whenever it is already absolute; a still
+// relative base (one declared before any absolute base was introduced) is
+// anchored to the source URL.
+func TestEffectiveBase(t *testing.T) {
+	doc, _ := url.Parse("https://feed.example.com/feed/index.xml")
+
+	for _, tc := range []struct {
+		name    string
+		inScope string
+		want    string
+	}{
+		{"no in-scope base", "", "https://feed.example.com/feed/index.xml"},
+		{"absolute in-scope base", "https://cdn.example.com/assets/", "https://cdn.example.com/assets/"},
+		{"relative directory base", "entries/", "https://feed.example.com/feed/entries/"},
+		{"relative root-relative base", "/shared/", "https://feed.example.com/shared/"},
+		{"nested relative base", "archive/2026/", "https://feed.example.com/feed/archive/2026/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var inScope *url.URL
+			if tc.inScope != "" {
+				inScope, _ = url.Parse(tc.inScope)
+			}
+			got := EffectiveBase(doc, inScope)
+			if got == nil || got.String() != tc.want {
+				t.Errorf("EffectiveBase(doc, %q) = %v, want %q", tc.inScope, got, tc.want)
+			}
+		})
+	}
+}
+
+// Without a document base, EffectiveBase must return the in-scope xml:base
+// unchanged so the no-source parse path keeps its historical behavior.
+func TestEffectiveBaseNoDocBase(t *testing.T) {
+	inScope, _ := url.Parse("entries/")
+	if got := EffectiveBase(nil, inScope); got != inScope {
+		t.Errorf("EffectiveBase(nil, inScope) = %v, want the in-scope base itself", got)
+	}
+	if got := EffectiveBase(nil, nil); got != nil {
+		t.Errorf("EffectiveBase(nil, nil) = %v, want nil", got)
+	}
+}
+
+// A nil in-scope base yields the document base itself.
+func TestEffectiveBaseDocOnly(t *testing.T) {
+	doc, _ := url.Parse("https://feed.example.com/feed.xml")
+	if got := EffectiveBase(doc, nil); got != doc {
+		t.Errorf("EffectiveBase(doc, nil) = %v, want doc itself", got)
+	}
+}
+
+// EffectiveBase must not mutate either of its inputs: the in-scope base is
+// the live value held on the parser's xml:base stack and the document base is
+// shared across every element of one parse (and potentially across parses).
+func TestEffectiveBaseDoesNotMutateInputs(t *testing.T) {
+	doc, _ := url.Parse("https://feed.example.com/feed/index.xml")
+	inScope, _ := url.Parse("entries/")
+	docBefore, scopeBefore := doc.String(), inScope.String()
+
+	_ = EffectiveBase(doc, inScope)
+
+	if doc.String() != docBefore {
+		t.Errorf("document base mutated: %q -> %q", docBefore, doc.String())
+	}
+	if inScope.String() != scopeBefore {
+		t.Errorf("in-scope base mutated: %q -> %q", scopeBefore, inScope.String())
+	}
+}
+
+// ResolveURL against a document base turns relative references absolute and
+// leaves absolute references and nil bases untouched.
+func TestResolveURL(t *testing.T) {
+	base, _ := url.Parse("https://feed.example.com/feed/")
+	for _, tc := range []struct {
+		ref, want string
+	}{
+		{"post/1", "https://feed.example.com/feed/post/1"},
+		{"/a.mp3", "https://feed.example.com/a.mp3"},
+		{"https://other.test/x", "https://other.test/x"},
+		{"", ""},
+	} {
+		if got := ResolveURL(base, tc.ref); got != tc.want {
+			t.Errorf("ResolveURL(base, %q) = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+	if got := ResolveURL(nil, "relative/path"); got != "relative/path" {
+		t.Errorf("ResolveURL(nil, ref) = %q, want the reference unchanged", got)
+	}
+}

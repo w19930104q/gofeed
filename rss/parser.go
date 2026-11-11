@@ -3,6 +3,7 @@ package rss
 import (
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,6 +28,18 @@ type Parser struct{}
 
 // Parse parses an xml feed into an rss.Feed
 func (rp *Parser) Parse(feed io.Reader) (*Feed, error) {
+	return rp.ParseWithBase(feed, nil)
+}
+
+// ParseWithBase parses an xml feed into an rss.Feed, using base as the
+// document-level source URL. Relative references are resolved against base,
+// combined with any xml:base values declared in the document. A nil base
+// reproduces Parse: only in-document xml:base values drive resolution, so
+// feeds without one keep their URLs exactly as written.
+//
+// The base is held for this parse only and never stored on the Parser, so one
+// Parser can parse different sources concurrently without leaking state.
+func (rp *Parser) ParseWithBase(feed io.Reader, base *url.URL) (*Feed, error) {
 	feed = shared.NewControlCharFilterReader(feed)
 	p := shared.NewXMLParser(feed)
 
@@ -35,10 +48,10 @@ func (rp *Parser) Parse(feed io.Reader) (*Feed, error) {
 		return nil, err
 	}
 
-	return rp.parseRoot(p)
+	return rp.parseRoot(p, base)
 }
 
-func (rp *Parser) parseRoot(p *xpp.Parser) (*Feed, error) {
+func (rp *Parser) parseRoot(p *xpp.Parser, docBase *url.URL) (*Feed, error) {
 	rssErr := p.Expect(xpp.StartTag, "rss")
 	rdfErr := p.Expect(xpp.StartTag, "rdf")
 	if rssErr != nil && rdfErr != nil {
@@ -63,7 +76,7 @@ func (rp *Parser) parseRoot(p *xpp.Parser) (*Feed, error) {
 		native = append([]string{space}, nativeNamespaces...)
 	}
 
-	err := shared.ForEachChild(p, func(name string) error {
+	err := shared.ForEachChildWithBase(p, docBase, func(name string) error {
 		// Skip any extensions found in the feed root.
 		if shared.IsExtension(p, native...) {
 			return p.Skip()
@@ -71,16 +84,16 @@ func (rp *Parser) parseRoot(p *xpp.Parser) (*Feed, error) {
 		var err error
 		switch name {
 		case "channel":
-			channel, err = rp.parseChannel(p, native)
+			channel, err = rp.parseChannel(p, native, docBase)
 		case "item":
 			var item *Item
-			if item, err = rp.parseItem(p, native); err == nil {
+			if item, err = rp.parseItem(p, native, docBase); err == nil {
 				items = append(items, item)
 			}
 		case "textinput":
 			textinput, err = rp.parseTextInput(p)
 		case "image":
-			image, err = rp.parseImage(p)
+			image, err = rp.parseImage(p, docBase)
 		default:
 			err = p.Skip()
 		}
@@ -117,7 +130,7 @@ func (rp *Parser) parseRoot(p *xpp.Parser) (*Feed, error) {
 	return channel, nil
 }
 
-func (rp *Parser) parseChannel(p *xpp.Parser, native []string) (rss *Feed, err error) {
+func (rp *Parser) parseChannel(p *xpp.Parser, native []string, docBase *url.URL) (rss *Feed, err error) {
 	if err = p.Expect(xpp.StartTag, "channel"); err != nil {
 		return nil, err
 	}
@@ -140,7 +153,7 @@ func (rp *Parser) parseChannel(p *xpp.Parser, native []string) (rss *Feed, err e
 		return nil
 	}
 
-	err = shared.ForEachChild(p, func(name string) error {
+	err = shared.ForEachChildWithBase(p, docBase, func(name string) error {
 		if shared.IsExtension(p, native...) {
 			extensions, err = shared.ParseExtension(extensions, p)
 			return err
@@ -152,7 +165,7 @@ func (rp *Parser) parseChannel(p *xpp.Parser, native []string) (rss *Feed, err e
 		case "description":
 			rss.Description, err = shared.ParseText(p)
 		case "link":
-			if rss.Link, err = rp.parseLink(p); err == nil {
+			if rss.Link, err = rp.parseLink(p, docBase); err == nil {
 				links = append(links, rss.Link)
 			}
 		case "language":
@@ -174,7 +187,7 @@ func (rp *Parser) parseChannel(p *xpp.Parser, native []string) (rss *Feed, err e
 		case "generator":
 			rss.Generator, err = shared.ParseText(p)
 		case "docs":
-			rss.Docs, err = shared.ParseTextURL(p)
+			rss.Docs, err = shared.ParseTextURLWithBase(p, docBase)
 		case "ttl":
 			rss.TTL, err = shared.ParseText(p)
 		case "rating":
@@ -185,7 +198,7 @@ func (rp *Parser) parseChannel(p *xpp.Parser, native []string) (rss *Feed, err e
 			rss.SkipDays, err = rp.parseSkipDays(p)
 		case "item":
 			var item *Item
-			if item, err = rp.parseItem(p, native); err == nil {
+			if item, err = rp.parseItem(p, native, docBase); err == nil {
 				rss.Items = append(rss.Items, item)
 			}
 		case "cloud":
@@ -196,7 +209,7 @@ func (rp *Parser) parseChannel(p *xpp.Parser, native []string) (rss *Feed, err e
 				categories = append(categories, cat)
 			}
 		case "image":
-			rss.Image, err = rp.parseImage(p)
+			rss.Image, err = rp.parseImage(p, docBase)
 		case "textinput":
 			rss.TextInput, err = rp.parseTextInput(p)
 		default:
@@ -237,7 +250,7 @@ func (rp *Parser) parseChannel(p *xpp.Parser, native []string) (rss *Feed, err e
 	return rss, nil
 }
 
-func (rp *Parser) parseItem(p *xpp.Parser, native []string) (item *Item, err error) {
+func (rp *Parser) parseItem(p *xpp.Parser, native []string, docBase *url.URL) (item *Item, err error) {
 	if err = p.Expect(xpp.StartTag, "item"); err != nil {
 		return nil, err
 	}
@@ -257,7 +270,7 @@ func (rp *Parser) parseItem(p *xpp.Parser, native []string) (item *Item, err err
 	enclosures := []*Enclosure{}
 	links := []string{}
 
-	err = shared.ForEachChild(p, func(name string) error {
+	err = shared.ForEachChildWithBase(p, docBase, func(name string) error {
 		var err error
 		// content:encoded is foreign to RSS but maps to item.Content; it must be
 		// claimed here or the extension routing below swallows it.
@@ -277,13 +290,13 @@ func (rp *Parser) parseItem(p *xpp.Parser, native []string) (item *Item, err err
 		case "encoded":
 			err = rp.parseItemCustom(p, item)
 		case "link":
-			if item.Link, err = rp.parseLink(p); err == nil {
+			if item.Link, err = rp.parseLink(p, docBase); err == nil {
 				links = append(links, item.Link)
 			}
 		case "author":
 			item.Author, err = shared.ParseText(p)
 		case "comments":
-			item.Comments, err = shared.ParseTextURL(p)
+			item.Comments, err = shared.ParseTextURLWithBase(p, docBase)
 		case "pubdate":
 			if item.PubDate, err = shared.ParseText(p); err == nil {
 				if date, derr := shared.ParseDate(item.PubDate); derr == nil {
@@ -361,8 +374,8 @@ func (rp *Parser) parseItemCustom(p *xpp.Parser, item *Item) error {
 	return nil
 }
 
-func (rp *Parser) parseLink(p *xpp.Parser) (url string, err error) {
-	base := p.BaseURL()
+func (rp *Parser) parseLink(p *xpp.Parser, docBase *url.URL) (url string, err error) {
+	base := shared.EffectiveBase(docBase, p.BaseURL())
 	href := p.Attribute("href")
 	url, err = shared.ParseText(p)
 	if err != nil {
@@ -371,7 +384,7 @@ func (rp *Parser) parseLink(p *xpp.Parser) (url string, err error) {
 	if url == "" && href != "" {
 		url = href
 	}
-	url = shared.ResolveURLIfBase(base, url)
+	url = shared.ResolveURL(base, url)
 	return url, err
 }
 
@@ -418,22 +431,22 @@ func (rp *Parser) parseEnclosure(p *xpp.Parser) (enclosure *Enclosure, err error
 	return enclosure, nil
 }
 
-func (rp *Parser) parseImage(p *xpp.Parser) (image *Image, err error) {
+func (rp *Parser) parseImage(p *xpp.Parser, docBase *url.URL) (image *Image, err error) {
 	if err = p.Expect(xpp.StartTag, "image"); err != nil {
 		return nil, err
 	}
 
 	image = &Image{}
 
-	err = shared.ForEachChild(p, func(name string) error {
+	err = shared.ForEachChildWithBase(p, docBase, func(name string) error {
 		var err error
 		switch name {
 		case "url":
-			image.URL, err = shared.ParseTextURL(p)
+			image.URL, err = shared.ParseTextURLWithBase(p, docBase)
 		case "title":
 			image.Title, err = shared.ParseText(p)
 		case "link":
-			image.Link, err = shared.ParseTextURL(p)
+			image.Link, err = shared.ParseTextURLWithBase(p, docBase)
 		case "width":
 			image.Width, err = shared.ParseText(p)
 		case "height":

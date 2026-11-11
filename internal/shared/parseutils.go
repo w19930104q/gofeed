@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"html"
+	"net/url"
 	"strings"
 
 	xpp "github.com/mmcdole/goxpp/v2"
@@ -62,12 +63,19 @@ func ParseText(p *xpp.Parser) (string, error) {
 // captured before ParseText runs, because ParseText consumes the element's end
 // tag, which pops the base off the stack.
 func ParseTextURL(p *xpp.Parser) (string, error) {
-	base := p.BaseURL()
+	return ParseTextURLWithBase(p, nil)
+}
+
+// ParseTextURLWithBase is ParseTextURL with the feed's document-level source
+// URL: the value resolves against EffectiveBase(docBase, xml:base in scope).
+// A nil docBase reproduces ParseTextURL's historical behavior.
+func ParseTextURLWithBase(p *xpp.Parser, docBase *url.URL) (string, error) {
+	base := EffectiveBase(docBase, p.BaseURL())
 	s, err := ParseText(p)
 	if err != nil {
 		return "", err
 	}
-	return ResolveURLIfBase(base, s), nil
+	return ResolveURL(base, s), nil
 }
 
 // StripCDATA removes CDATA tags from the string

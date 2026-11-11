@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -38,6 +39,20 @@ type Parser struct{}
 
 // Parse parses an xml feed into an atom.Feed
 func (ap *Parser) Parse(feed io.Reader) (*Feed, error) {
+	return ap.ParseWithBase(feed, nil)
+}
+
+// ParseWithBase parses an xml feed into an atom.Feed, using base as the
+// document-level source URL. Relative references are resolved against base,
+// combined with any xml:base values declared in the document. A nil base
+// reproduces Parse: only in-document xml:base values drive resolution, so
+// feeds without one keep their URLs exactly as written.
+//
+// The base is held for this parse only and never stored on the Parser, so one
+// Parser can parse different sources concurrently without leaking state.
+// Atom <id> values are identifiers rather than links and are never resolved
+// against the document base; they keep the value from the document.
+func (ap *Parser) ParseWithBase(feed io.Reader, base *url.URL) (*Feed, error) {
 	feed = shared.NewControlCharFilterReader(feed)
 	p := shared.NewXMLParser(feed)
 
@@ -46,10 +61,10 @@ func (ap *Parser) Parse(feed io.Reader) (*Feed, error) {
 		return nil, err
 	}
 
-	return ap.parseRoot(p)
+	return ap.parseRoot(p, base)
 }
 
-func (ap *Parser) parseRoot(p *xpp.Parser) (*Feed, error) {
+func (ap *Parser) parseRoot(p *xpp.Parser, docBase *url.URL) (*Feed, error) {
 	if err := p.Expect(xpp.StartTag, "feed"); err != nil {
 		return nil, err
 	}
@@ -65,7 +80,7 @@ func (ap *Parser) parseRoot(p *xpp.Parser) (*Feed, error) {
 	links := []*Link{}
 	extensions := ext.Extensions{}
 
-	err := shared.ForEachChild(p, func(name string) error {
+	err := shared.ForEachChildWithBase(p, docBase, func(name string) error {
 		if shared.IsExtension(p, nativeNamespaces...) {
 			var err error
 			extensions, err = shared.ParseExtension(extensions, p)
@@ -74,36 +89,36 @@ func (ap *Parser) parseRoot(p *xpp.Parser) (*Feed, error) {
 		var err error
 		switch name {
 		case "title":
-			atom.Title, err = ap.parseAtomText(p)
+			atom.Title, err = ap.parseAtomText(p, docBase)
 		case "id":
-			atom.ID, err = ap.parseAtomText(p)
+			atom.ID, err = ap.parseAtomText(p, docBase)
 		case "updated", "modified":
-			if atom.Updated, err = ap.parseAtomText(p); err == nil {
+			if atom.Updated, err = ap.parseAtomText(p, docBase); err == nil {
 				atom.UpdatedParsed = parseDateUTC(atom.Updated)
 			}
 		case "subtitle", "tagline":
-			atom.Subtitle, err = ap.parseAtomText(p)
+			atom.Subtitle, err = ap.parseAtomText(p, docBase)
 		case "link":
 			var link *Link
 			if link, err = ap.parseLink(p); err == nil {
 				links = append(links, link)
 			}
 		case "generator":
-			atom.Generator, err = ap.parseGenerator(p)
+			atom.Generator, err = ap.parseGenerator(p, docBase)
 		case "icon":
-			atom.Icon, err = ap.parseAtomText(p)
+			atom.Icon, err = ap.parseAtomText(p, docBase)
 		case "logo":
-			atom.Logo, err = ap.parseAtomText(p)
+			atom.Logo, err = ap.parseAtomText(p, docBase)
 		case "rights", "copyright":
-			atom.Rights, err = ap.parseAtomText(p)
+			atom.Rights, err = ap.parseAtomText(p, docBase)
 		case "contributor":
 			var person *Person
-			if person, err = ap.parsePerson("contributor", p); err == nil {
+			if person, err = ap.parsePerson("contributor", p, docBase); err == nil {
 				contributors = append(contributors, person)
 			}
 		case "author":
 			var person *Person
-			if person, err = ap.parsePerson("author", p); err == nil {
+			if person, err = ap.parsePerson("author", p, docBase); err == nil {
 				authors = append(authors, person)
 			}
 		case "category":
@@ -113,7 +128,7 @@ func (ap *Parser) parseRoot(p *xpp.Parser) (*Feed, error) {
 			}
 		case "entry":
 			var entry *Entry
-			if entry, err = ap.parseEntry(p); err == nil {
+			if entry, err = ap.parseEntry(p, docBase); err == nil {
 				atom.Entries = append(atom.Entries, entry)
 			}
 		default:
@@ -162,7 +177,7 @@ func parseDateUTC(text string) *time.Time {
 	return nil
 }
 
-func (ap *Parser) parseEntry(p *xpp.Parser) (*Entry, error) {
+func (ap *Parser) parseEntry(p *xpp.Parser, docBase *url.URL) (*Entry, error) {
 	if err := p.Expect(xpp.StartTag, "entry"); err != nil {
 		return nil, err
 	}
@@ -174,7 +189,7 @@ func (ap *Parser) parseEntry(p *xpp.Parser) (*Entry, error) {
 	links := []*Link{}
 	extensions := ext.Extensions{}
 
-	err := shared.ForEachChild(p, func(name string) error {
+	err := shared.ForEachChildWithBase(p, docBase, func(name string) error {
 		if shared.IsExtension(p, nativeNamespaces...) {
 			var err error
 			extensions, err = shared.ParseExtension(extensions, p)
@@ -183,27 +198,27 @@ func (ap *Parser) parseEntry(p *xpp.Parser) (*Entry, error) {
 		var err error
 		switch name {
 		case "title":
-			entry.Title, err = ap.parseAtomText(p)
+			entry.Title, err = ap.parseAtomText(p, docBase)
 		case "id":
-			entry.ID, err = ap.parseAtomText(p)
+			entry.ID, err = ap.parseAtomText(p, docBase)
 		case "rights", "copyright":
-			entry.Rights, err = ap.parseAtomText(p)
+			entry.Rights, err = ap.parseAtomText(p, docBase)
 		case "summary":
-			entry.Summary, err = ap.parseAtomText(p)
+			entry.Summary, err = ap.parseAtomText(p, docBase)
 		case "source":
-			entry.Source, err = ap.parseSource(p)
+			entry.Source, err = ap.parseSource(p, docBase)
 		case "updated", "modified":
-			if entry.Updated, err = ap.parseAtomText(p); err == nil {
+			if entry.Updated, err = ap.parseAtomText(p, docBase); err == nil {
 				entry.UpdatedParsed = parseDateUTC(entry.Updated)
 			}
 		case "contributor":
 			var person *Person
-			if person, err = ap.parsePerson("contributor", p); err == nil {
+			if person, err = ap.parsePerson("contributor", p, docBase); err == nil {
 				contributors = append(contributors, person)
 			}
 		case "author":
 			var person *Person
-			if person, err = ap.parsePerson("author", p); err == nil {
+			if person, err = ap.parsePerson("author", p, docBase); err == nil {
 				authors = append(authors, person)
 			}
 		case "category":
@@ -217,11 +232,11 @@ func (ap *Parser) parseEntry(p *xpp.Parser) (*Entry, error) {
 				links = append(links, link)
 			}
 		case "published", "issued":
-			if entry.Published, err = ap.parseAtomText(p); err == nil {
+			if entry.Published, err = ap.parseAtomText(p, docBase); err == nil {
 				entry.PublishedParsed = parseDateUTC(entry.Published)
 			}
 		case "content":
-			entry.Content, err = ap.parseContent(p)
+			entry.Content, err = ap.parseContent(p, docBase)
 		default:
 			err = p.Skip()
 		}
@@ -258,7 +273,7 @@ func (ap *Parser) parseEntry(p *xpp.Parser) (*Entry, error) {
 	return entry, nil
 }
 
-func (ap *Parser) parseSource(p *xpp.Parser) (*Source, error) {
+func (ap *Parser) parseSource(p *xpp.Parser, docBase *url.URL) (*Source, error) {
 	if err := p.Expect(xpp.StartTag, "source"); err != nil {
 		return nil, err
 	}
@@ -271,7 +286,7 @@ func (ap *Parser) parseSource(p *xpp.Parser) (*Source, error) {
 	links := []*Link{}
 	extensions := ext.Extensions{}
 
-	err := shared.ForEachChild(p, func(name string) error {
+	err := shared.ForEachChildWithBase(p, docBase, func(name string) error {
 		if shared.IsExtension(p, nativeNamespaces...) {
 			var err error
 			extensions, err = shared.ParseExtension(extensions, p)
@@ -280,36 +295,36 @@ func (ap *Parser) parseSource(p *xpp.Parser) (*Source, error) {
 		var err error
 		switch name {
 		case "title":
-			source.Title, err = ap.parseAtomText(p)
+			source.Title, err = ap.parseAtomText(p, docBase)
 		case "id":
-			source.ID, err = ap.parseAtomText(p)
+			source.ID, err = ap.parseAtomText(p, docBase)
 		case "updated", "modified":
-			if source.Updated, err = ap.parseAtomText(p); err == nil {
+			if source.Updated, err = ap.parseAtomText(p, docBase); err == nil {
 				source.UpdatedParsed = parseDateUTC(source.Updated)
 			}
 		case "subtitle", "tagline":
-			source.Subtitle, err = ap.parseAtomText(p)
+			source.Subtitle, err = ap.parseAtomText(p, docBase)
 		case "link":
 			var link *Link
 			if link, err = ap.parseLink(p); err == nil {
 				links = append(links, link)
 			}
 		case "generator":
-			source.Generator, err = ap.parseGenerator(p)
+			source.Generator, err = ap.parseGenerator(p, docBase)
 		case "icon":
-			source.Icon, err = ap.parseAtomText(p)
+			source.Icon, err = ap.parseAtomText(p, docBase)
 		case "logo":
-			source.Logo, err = ap.parseAtomText(p)
+			source.Logo, err = ap.parseAtomText(p, docBase)
 		case "rights", "copyright":
-			source.Rights, err = ap.parseAtomText(p)
+			source.Rights, err = ap.parseAtomText(p, docBase)
 		case "contributor":
 			var person *Person
-			if person, err = ap.parsePerson("contributor", p); err == nil {
+			if person, err = ap.parsePerson("contributor", p, docBase); err == nil {
 				contributors = append(contributors, person)
 			}
 		case "author":
 			var person *Person
-			if person, err = ap.parsePerson("author", p); err == nil {
+			if person, err = ap.parsePerson("author", p, docBase); err == nil {
 				authors = append(authors, person)
 			}
 		case "category":
@@ -353,12 +368,12 @@ func (ap *Parser) parseSource(p *xpp.Parser) (*Source, error) {
 	return source, nil
 }
 
-func (ap *Parser) parseContent(p *xpp.Parser) (*Content, error) {
+func (ap *Parser) parseContent(p *xpp.Parser, docBase *url.URL) (*Content, error) {
 	c := &Content{}
 	c.Type = p.Attribute("type")
 	c.Src = p.Attribute("src")
 
-	text, err := ap.parseAtomText(p)
+	text, err := ap.parseAtomText(p, docBase)
 	if err != nil {
 		return nil, err
 	}
@@ -367,22 +382,22 @@ func (ap *Parser) parseContent(p *xpp.Parser) (*Content, error) {
 	return c, nil
 }
 
-func (ap *Parser) parsePerson(name string, p *xpp.Parser) (*Person, error) {
+func (ap *Parser) parsePerson(name string, p *xpp.Parser, docBase *url.URL) (*Person, error) {
 	if err := p.Expect(xpp.StartTag, name); err != nil {
 		return nil, err
 	}
 
 	person := &Person{}
 
-	err := shared.ForEachChild(p, func(child string) error {
+	err := shared.ForEachChildWithBase(p, docBase, func(child string) error {
 		var err error
 		switch child {
 		case "name":
-			person.Name, err = ap.parseAtomText(p)
+			person.Name, err = ap.parseAtomText(p, docBase)
 		case "email":
-			person.Email, err = ap.parseAtomText(p)
+			person.Email, err = ap.parseAtomText(p, docBase)
 		case "uri", "url", "homepage":
-			person.URI, err = ap.parseAtomText(p)
+			person.URI, err = ap.parseAtomText(p, docBase)
 		default:
 			err = p.Skip()
 		}
@@ -445,7 +460,7 @@ func (ap *Parser) parseCategory(p *xpp.Parser) (*Category, error) {
 	return c, nil
 }
 
-func (ap *Parser) parseGenerator(p *xpp.Parser) (*Generator, error) {
+func (ap *Parser) parseGenerator(p *xpp.Parser, docBase *url.URL) (*Generator, error) {
 
 	if err := p.Expect(xpp.StartTag, "generator"); err != nil {
 		return nil, err
@@ -464,7 +479,7 @@ func (ap *Parser) parseGenerator(p *xpp.Parser) (*Generator, error) {
 
 	g.Version = p.Attribute("version")
 
-	result, err := ap.parseAtomText(p)
+	result, err := ap.parseAtomText(p, docBase)
 	if err != nil {
 		return nil, err
 	}
@@ -478,7 +493,7 @@ func (ap *Parser) parseGenerator(p *xpp.Parser) (*Generator, error) {
 	return g, nil
 }
 
-func (ap *Parser) parseAtomText(p *xpp.Parser) (string, error) {
+func (ap *Parser) parseAtomText(p *xpp.Parser, docBase *url.URL) (string, error) {
 
 	var text struct {
 		Type     string `xml:"type,attr"`
@@ -487,7 +502,7 @@ func (ap *Parser) parseAtomText(p *xpp.Parser) (string, error) {
 	}
 
 	// get current base URL before it is clobbered by DecodeElement
-	base := p.BaseURL()
+	inScopeBase := p.BaseURL()
 	err := p.DecodeElement(&text)
 	if err != nil {
 		return "", err
@@ -502,7 +517,7 @@ func (ap *Parser) parseAtomText(p *xpp.Parser) (string, error) {
 	if strings.Contains(result, "<![CDATA[") {
 		result = shared.StripCDATA(result)
 		if lowerType == "html" || strings.Contains(lowerType, "xhtml") {
-			result, _ = shared.ResolveHTML(base, result)
+			result, _ = shared.ResolveHTML(shared.EffectiveBase(docBase, inScopeBase), result)
 		}
 	} else {
 		// decode non-CDATA contents depending on type
@@ -513,11 +528,11 @@ func (ap *Parser) parseAtomText(p *xpp.Parser) (string, error) {
 			result = shared.DecodeEntities(result)
 		} else if strings.Contains(lowerType, "xhtml") {
 			result = ap.stripWrappingDiv(result)
-			result, _ = shared.ResolveHTML(base, result)
+			result, _ = shared.ResolveHTML(shared.EffectiveBase(docBase, inScopeBase), result)
 		} else if lowerType == "html" {
 			result = ap.stripWrappingDiv(result)
 			result = shared.DecodeEntities(result)
-			result, _ = shared.ResolveHTML(base, result)
+			result, _ = shared.ResolveHTML(shared.EffectiveBase(docBase, inScopeBase), result)
 		} else if lowerMode == "base64" || isBinaryMediaType(lowerType) {
 			// Decode base64 only when the content says so: an explicit Atom 0.3
 			// mode="base64", or a binary media type. Decoding by default
@@ -533,7 +548,13 @@ func (ap *Parser) parseAtomText(p *xpp.Parser) (string, error) {
 	// resolve relative URIs in URI-containing elements according to xml:base
 	name := strings.ToLower(p.Name())
 	if atomUriElements[name] {
-		result = shared.ResolveURLIfBase(base, result)
+		// An atom:id (including the id inside <source>) is a permanent
+		// identifier, not a retrievable link: keep its value verbatim under
+		// every base, including an in-document xml:base. Everything else in
+		// atomUriElements resolves against the effective base.
+		if name != "id" {
+			result = shared.ResolveURL(shared.EffectiveBase(docBase, inScopeBase), result)
+		}
 	}
 
 	return result, err
