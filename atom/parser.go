@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -22,14 +23,18 @@ var (
 		shared.Atom03Namespace,
 	}
 
-	// Atom elements which contain URIs
+	// Atom elements which contain URIs.
 	// https://tools.ietf.org/html/rfc4287
+	// "id" is deliberately absent: RFC 4287 section 3.1.1 excludes atom:id
+	// from the relative-IRI resolution rules of section 2.2, so IDs stay
+	// exactly as authored (a GUID-equivalent identifier), even when an
+	// xml:base or document base is in scope.
 	atomUriElements = map[string]bool{
-		"icon": true,
-		"id":   true,
-		"logo": true,
-		"uri":  true,
-		"url":  true, // atom 0.3
+		"icon":     true,
+		"logo":     true,
+		"uri":      true,
+		"url":      true, // atom 0.3
+		"homepage": true, // atom 0.3 author/contributor homepage
 	}
 )
 
@@ -38,8 +43,17 @@ type Parser struct{}
 
 // Parse parses an xml feed into an atom.Feed
 func (ap *Parser) Parse(feed io.Reader) (*Feed, error) {
+	return ap.ParseWithBase(feed, nil)
+}
+
+// ParseWithBase parses an xml feed into an atom.Feed, resolving relative URLs
+// against base as though it were an xml:base declared on the document element.
+// A nil base preserves Parse's behavior exactly. The base is carried on the
+// token stream for the duration of this call, so a single Parser can parse
+// feeds with different bases concurrently.
+func (ap *Parser) ParseWithBase(feed io.Reader, base *url.URL) (*Feed, error) {
 	feed = shared.NewControlCharFilterReader(feed)
-	p := shared.NewXMLParser(feed)
+	p := shared.NewXMLParserWithBase(feed, base)
 
 	_, err := shared.FindRoot(p)
 	if err != nil {

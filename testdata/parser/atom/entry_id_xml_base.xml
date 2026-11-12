@@ -1,5 +1,5 @@
 <!--
-Description: entry id relative to xml:base
+Description: entry id is excluded from xml:base resolution (RFC 4287 3.1.1) and stays as authored
 -->
 <feed xmlns="http://www.w3.org/2005/Atom" xml:base="http://example.com/test/">
 <entry>

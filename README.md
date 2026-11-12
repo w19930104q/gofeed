@@ -221,6 +221,53 @@ feed, _ := fp.ParseString(feedData)
 fmt.Println(feed.Author) // Valentine Wiggin
 ```
 
+#### Resolving Relative Links
+
+Feeds commonly contain relative links (`post/1`, `/logo.png`, `media/a.mp3`).
+By default gofeed returns them exactly as authored. Opt in to document-base
+resolution and every relative reference comes back absolute and ready to use.
+
+For `io.Reader` and string inputs, pass the document's absolute base URL to
+`ParseWithBase` / `ParseStringWithBase`. The base must be absolute; a relative
+one returns `gofeed.ErrBaseURLNotAbsolute`.
+
+```go
+base, _ := url.Parse("https://example.com/feeds/index.xml")
+fp := gofeed.NewParser()
+feed, err := fp.ParseWithBase(reader, base)
+```
+
+For HTTP inputs, `ParseURLResolved` (and its cancellable form
+`ParseURLResolvedWithContext`) resolve against the **final response URL**, so
+links stay correct when the server redirects to another host or directory:
+
+```go
+fp := gofeed.NewParser()
+feed, err := fp.ParseURLResolved("https://example.com/feed.xml")
+```
+
+What gets resolved:
+
+- RSS, Atom and JSON Feed site/item links, author URLs, images and
+  attachments/enclosures;
+- URI attributes inside body HTML (`href`, `src`, `poster`, `action`, ...);
+- RSS/Atom in-document `xml:base` declarations, which stack on top of the
+  document base — nested bases accumulate and a closing element restores the
+  sibling scope, exactly per RFC 3986.
+
+What is deliberately left untouched:
+
+- identifiers — Atom/RSS IDs and GUIDs and JSON item `id` — even when they
+  look like links, plus all plain-text fields;
+- references that fail to parse, which stay as authored;
+- no derived link is ever fetched — resolution is purely local string work.
+
+The specialized `rss.Parser`, `atom.Parser` and `json.Parser` expose the same
+opt-in through `ParseWithBase(reader, base)`. A `nil` base (and every legacy
+entry point: `Parse`, `ParseString`, `ParseURL`, `ParseURLWithContext`) keeps
+the historical, non-resolving behavior. Custom `Translator` implementations
+and `Feed.OriginalFeed()` see the same resolved source object.
+
 ## Dependencies
 
 * [goxpp](https://github.com/mmcdole/goxpp) - XML pull parser

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -28,6 +29,11 @@ var ErrResponseTooLarge = errors.New("gofeed: response body exceeds MaxByteSize"
 // ErrFeedTypeNotDetected is returned when the detection system can not figure
 // out the Feed format
 var ErrFeedTypeNotDetected = errors.New("failed to detect feed type")
+
+// ErrBaseURLNotAbsolute is returned by the base-aware entry points when the
+// document base URL is neither empty nor absolute. Relative references can
+// only be resolved against an absolute base.
+var ErrBaseURLNotAbsolute = errors.New("gofeed: base url must be absolute")
 
 // HTTPError represents an HTTP error returned by a server.
 type HTTPError struct {
@@ -107,6 +113,24 @@ const detectionPeekSize = 4096
 // content is then parsed incrementally from the reader. JSON feeds are read
 // fully into memory, as JSON decoding needs the complete document.
 func (f *Parser) Parse(feed io.Reader) (*Feed, error) {
+	return f.parse(feed, nil)
+}
+
+// ParseWithBase behaves like Parse but treats base as the document base URL:
+// relative links in the feed are resolved against it and come back absolute,
+// ready to use. Base must be absolute (or nil, which is equivalent to Parse).
+// In-document xml:base declarations still take effect on top of it.
+// Identifiers (Atom/RSS IDs and GUIDs, JSON item ids), plain text and
+// references that fail to parse are left exactly as authored, and no derived
+// link is ever requested over the network.
+func (f *Parser) ParseWithBase(feed io.Reader, base *url.URL) (*Feed, error) {
+	if err := validateBase(base); err != nil {
+		return nil, err
+	}
+	return f.parse(feed, base)
+}
+
+func (f *Parser) parse(feed io.Reader, base *url.URL) (*Feed, error) {
 	// Peek at the start of the stream to detect the feed type, without
 	// consuming it: the format parser below reads from the beginning. A
 	// reader error here surfaces as itself rather than as a failed type
@@ -119,14 +143,23 @@ func (f *Parser) Parse(feed io.Reader) (*Feed, error) {
 
 	switch DetectFeedType(bytes.NewReader(prefix)) {
 	case FeedTypeAtom:
-		return f.parseAtomFeed(br)
+		return f.parseAtomFeed(br, base)
 	case FeedTypeRSS:
-		return f.parseRSSFeed(br)
+		return f.parseRSSFeed(br, base)
 	case FeedTypeJSON:
-		return f.parseJSONFeed(br)
+		return f.parseJSONFeed(br, base)
 	}
 
 	return nil, ErrFeedTypeNotDetected
+}
+
+// validateBase rejects a non-nil relative base: RFC 3986 reference
+// resolution needs an absolute base to produce a usable absolute URL.
+func validateBase(base *url.URL) error {
+	if base != nil && !base.IsAbs() {
+		return ErrBaseURLNotAbsolute
+	}
+	return nil
 }
 
 // ParseURL fetches the contents of a given url and
@@ -138,6 +171,16 @@ func (f *Parser) ParseURL(feedURL string) (feed *Feed, err error) {
 	return f.ParseURLWithContext(feedURL, ctx)
 }
 
+// ParseURLResolved fetches the contents of a given url, parses the response
+// into the universal feed type, and resolves every relative link against the
+// final response URL — the URL after redirects, obtained from resp.Request.URL.
+// It applies the same default timeout as ParseURL.
+func (f *Parser) ParseURLResolved(feedURL string) (feed *Feed, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	return f.ParseURLResolvedWithContext(feedURL, ctx)
+}
+
 // ParseURLWithContext fetches contents of a given url and
 // attempts to parse the response into the universal feed type.
 // You can instantiate the Auth structure with your Username and Password
@@ -145,6 +188,29 @@ func (f *Parser) ParseURL(feedURL string) (feed *Feed, err error) {
 // It will be automatically added to the header of the request
 // Request could be canceled or timeout via given context
 func (f *Parser) ParseURLWithContext(feedURL string, ctx context.Context) (feed *Feed, err error) {
+	return f.fetchAndParse(feedURL, ctx, nil)
+}
+
+// ParseURLResolvedWithContext is the cancellable form of ParseURLResolved:
+// relative links resolve against the final response URL (resp.Request.URL),
+// which already reflects any redirects the configured Client followed.
+func (f *Parser) ParseURLResolvedWithContext(feedURL string, ctx context.Context) (feed *Feed, err error) {
+	parsed, err := url.Parse(feedURL)
+	if err != nil {
+		return nil, err
+	}
+	if !parsed.IsAbs() {
+		return nil, ErrBaseURLNotAbsolute
+	}
+	return f.fetchAndParse(feedURL, ctx, parsed)
+}
+
+// fetchAndParse performs the HTTP request and parses the body. When baseHint
+// is non-nil, resolution is enabled and the final response URL (which may
+// differ from both the hint and the requested URL after a redirect) is used
+// as the document base. A nil hint keeps the historical, non-resolving
+// behavior.
+func (f *Parser) fetchAndParse(feedURL string, ctx context.Context, baseHint *url.URL) (feed *Feed, err error) {
 	client := f.httpClient()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
@@ -178,22 +244,34 @@ func (f *Parser) ParseURLWithContext(feedURL string, ctx context.Context) (feed 
 		}
 	}
 
-	if f.MaxByteSize <= 0 {
-		return f.Parse(resp.Body)
+	// Resolution, when requested, keys off the final response URL so
+	// redirects to another host or directory resolve correctly.
+	var base *url.URL
+	if baseHint != nil {
+		base = resp.Request.URL
+		if base == nil || !base.IsAbs() {
+			base = baseHint
+		}
 	}
-	body := &limitedReader{r: resp.Body, left: f.MaxByteSize}
-	feed, err = f.Parse(body)
-	if body.err == ErrResponseTooLarge {
+
+	var body io.Reader = resp.Body
+	if f.MaxByteSize > 0 {
+		body = &limitedReader{r: resp.Body, left: f.MaxByteSize}
+	}
+	feed, err = f.parse(body, base)
+	if lerr, ok := body.(*limitedReader); ok && lerr.err == ErrResponseTooLarge {
 		return nil, ErrResponseTooLarge
 	}
 	if err != nil {
 		return nil, err
 	}
-	// XML parsers stop at the root's closing tag. Check the remaining body
-	// through the same limit before returning success, including any error
-	// that a buffered parser has not observed yet.
-	if _, err = io.Copy(io.Discard, body); err != nil {
-		return nil, err
+	if lerr, ok := body.(*limitedReader); ok {
+		// XML parsers stop at the root's closing tag. Check the remaining body
+		// through the same limit before returning success, including any error
+		// that a buffered parser has not observed yet.
+		if _, err = io.Copy(io.Discard, lerr); err != nil {
+			return nil, err
+		}
 	}
 	return feed, nil
 }
@@ -235,8 +313,14 @@ func (f *Parser) ParseString(feed string) (*Feed, error) {
 	return f.Parse(strings.NewReader(feed))
 }
 
-func (f *Parser) parseAtomFeed(feed io.Reader) (*Feed, error) {
-	af, err := f.ap.Parse(feed)
+// ParseStringWithBase is ParseString with an explicit document base URL,
+// behaving as ParseWithBase does for readers.
+func (f *Parser) ParseStringWithBase(feed string, base *url.URL) (*Feed, error) {
+	return f.ParseWithBase(strings.NewReader(feed), base)
+}
+
+func (f *Parser) parseAtomFeed(feed io.Reader, base *url.URL) (*Feed, error) {
+	af, err := f.ap.ParseWithBase(feed, base)
 	if err != nil {
 		return nil, err
 	}
@@ -245,8 +329,8 @@ func (f *Parser) parseAtomFeed(feed io.Reader) (*Feed, error) {
 	return result, err
 }
 
-func (f *Parser) parseRSSFeed(feed io.Reader) (*Feed, error) {
-	rf, err := f.rp.Parse(feed)
+func (f *Parser) parseRSSFeed(feed io.Reader, base *url.URL) (*Feed, error) {
+	rf, err := f.rp.ParseWithBase(feed, base)
 	if err != nil {
 		return nil, err
 	}
@@ -256,8 +340,8 @@ func (f *Parser) parseRSSFeed(feed io.Reader) (*Feed, error) {
 	return result, err
 }
 
-func (f *Parser) parseJSONFeed(feed io.Reader) (*Feed, error) {
-	jf, err := f.jp.Parse(feed)
+func (f *Parser) parseJSONFeed(feed io.Reader, base *url.URL) (*Feed, error) {
+	jf, err := f.jp.ParseWithBase(feed, base)
 	if err != nil {
 		return nil, err
 	}
